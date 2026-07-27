@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-SOFASCORE_BASE = "https://api.sofascore.com/api/v1"
+SOFASCORE_BASE = "https://www.sofascore.com/api/v1"
 
 HEADERS = {
     "User-Agent": (
