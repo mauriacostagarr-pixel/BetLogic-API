@@ -1,20 +1,20 @@
 """
-Football Data Microservice
---------------------------
-Proxy para la API interna de SofaScore.
-Endpoints pensados para análisis pre-partido y predicciones.
+Football Data Microservice - FotMob Edition
+-------------------------------------------
+Usa la API interna de FotMob (sin bloqueos desde cloud).
+No requiere ScraperAPI ni proxies.
 
-Uso:
-  GET /matches/date/<YYYY-MM-DD>     → partidos del día
-  GET /match/<id>/stats              → corners, tarjetas, tiros, posesión
-  GET /match/<id>/lineups            → alineaciones y formaciones
-  GET /match/<id>/h2h                → historial cara a cara
-  GET /team/<id>/form                → últimos 5 resultados del equipo
-  GET /match/<id>/prematch           → resumen completo: H2H + forma local + forma visitante
-  GET /health                        → estado del servicio
+Endpoints:
+  GET /health
+  GET /matches/date/YYYYMMDD          → partidos del día (ej: 20260727)
+  GET /match/<id>/details             → stats, corners, tarjetas, lineup, H2H
+  GET /match/<id>/stats               → solo estadísticas del partido
+  GET /match/<id>/lineups             → alineaciones y formaciones
+  GET /match/<id>/h2h                 → historial cara a cara
+  GET /team/<id>/info                 → info del equipo + últimos partidos
+  GET /league/<id>/table              → tabla de posiciones
 """
 
-import time
 import os
 import logging
 
@@ -26,22 +26,17 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-SOFASCORE_BASE = "https://www.sofascore.com/api/v1"
+FOTMOB_BASE = "https://www.fotmob.com/api"
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.sofascore.com/",
-    "Origin": "https://www.sofascore.com",
+    "Referer": "https://www.fotmob.com/",
+    "Origin": "https://www.fotmob.com",
 }
 
 API_KEY = os.environ.get("FOOTBALL_API_KEY", "")
-SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
 
 
 def check_api_key():
@@ -53,259 +48,215 @@ def check_api_key():
     return None
 
 
-def sofascore_get(endpoint: str):
-    target_url = f"{SOFASCORE_BASE}{endpoint}"
-
-    if SCRAPER_API_KEY:
-        params = {
-            "api_key": SCRAPER_API_KEY,
-            "url": target_url,
-            "keep_headers": "true",
-        }
-        try:
-            resp = requests.get(
-                "http://api.scraperapi.com",
-                params=params,
-                headers=HEADERS,
-                timeout=30
-            )
-            resp.raise_for_status()
-            return resp.json(), None
-        except requests.exceptions.HTTPError as e:
-            logger.error("ScraperAPI HTTP error %s -> %s", e.response.status_code, target_url)
-            return None, f"HTTP {e.response.status_code}"
-        except requests.exceptions.RequestException as e:
-            logger.error("ScraperAPI error -> %s: %s", target_url, str(e))
-            return None, str(e)
-    else:
-        try:
-            resp = requests.get(target_url, headers=HEADERS, timeout=12)
-            resp.raise_for_status()
-            return resp.json(), None
-        except requests.exceptions.HTTPError as e:
-            logger.error("HTTP error %s -> %s", e.response.status_code, target_url)
-            return None, f"HTTP {e.response.status_code}"
-        except requests.exceptions.RequestException as e:
-            logger.error("Request error -> %s: %s", target_url, str(e))
-            return None, str(e)
+def fotmob_get(endpoint: str, params: dict = None):
+    url = f"{FOTMOB_BASE}{endpoint}"
+    try:
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        resp.raise_for_status()
+        return resp.json(), None
+    except requests.exceptions.HTTPError as e:
+        logger.error("HTTP error %s -> %s", e.response.status_code, url)
+        return None, f"HTTP {e.response.status_code}"
+    except requests.exceptions.RequestException as e:
+        logger.error("Request error -> %s: %s", url, str(e))
+        return None, str(e)
 
 
-def parse_result(home_score, away_score, team_is_home: bool) -> str:
-    if home_score is None or away_score is None:
+def parse_result(score_str: str, is_home: bool) -> str:
+    """Determina W/D/L desde el scoreStr de FotMob (ej: '2 - 1')."""
+    try:
+        parts = score_str.replace(" ", "").split("-")
+        home = int(parts[0])
+        away = int(parts[1])
+        if home == away:
+            return "D"
+        home_wins = home > away
+        return "W" if (home_wins == is_home) else "L"
+    except Exception:
         return "N/A"
-    if home_score == away_score:
-        return "D"
-    home_wins = home_score > away_score
-    return "W" if (home_wins == team_is_home) else "L"
-
-
-def format_event(event: dict, team_id=None) -> dict:
-    hs = event.get("homeScore", {}).get("current")
-    as_ = event.get("awayScore", {}).get("current")
-    home_id = event.get("homeTeam", {}).get("id")
-    is_home = home_id == team_id if team_id else None
-
-    base = {
-        "match_id": event.get("id"),
-        "date_ts": event.get("startTimestamp"),
-        "tournament": event.get("tournament", {}).get("name"),
-        "country": event.get("tournament", {}).get("category", {}).get("name"),
-        "home_team": event.get("homeTeam", {}).get("name"),
-        "home_team_id": home_id,
-        "away_team": event.get("awayTeam", {}).get("name"),
-        "away_team_id": event.get("awayTeam", {}).get("id"),
-        "home_score": hs,
-        "away_score": as_,
-        "status": event.get("status", {}).get("description"),
-        "winner_code": event.get("winnerCode"),
-    }
-
-    if team_id is not None:
-        base["venue"] = "home" if is_home else "away"
-        base["result"] = parse_result(hs, as_, is_home)
-
-    return base
 
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "service": "football-data-api", "scraper": bool(SCRAPER_API_KEY)})
+    return jsonify({"status": "ok", "service": "football-data-api", "source": "fotmob"})
 
 
 @app.route("/matches/date/<date>")
 def matches_by_date(date: str):
+    """
+    Partidos del día. Fecha en formato YYYYMMDD.
+    GET /matches/date/20260727
+    Opcional: ?league=<nombre parcial>
+    """
     auth_error = check_api_key()
     if auth_error:
         return auth_error
 
-    data, error = sofascore_get(f"/sport/football/scheduled-events/{date}")
+    data, error = fotmob_get("/matches", params={"date": date})
     if error:
         return jsonify({"error": error}), 502
 
     league_filter = request.args.get("league", "").lower()
     matches = []
 
-    for event in data.get("events", []):
-        m = format_event(event)
-        if league_filter and league_filter not in (m.get("tournament") or "").lower():
+    for league in data.get("leagues", []):
+        league_name = league.get("name", "")
+        if league_filter and league_filter not in league_name.lower():
             continue
-        matches.append(m)
+        for m in league.get("matches", []):
+            home = m.get("home", {})
+            away = m.get("away", {})
+            matches.append({
+                "match_id": m.get("id"),
+                "league": league_name,
+                "league_id": league.get("id"),
+                "home_team": home.get("name"),
+                "home_team_id": home.get("id"),
+                "away_team": away.get("name"),
+                "away_team_id": away.get("id"),
+                "score": m.get("status", {}).get("scoreStr"),
+                "status": m.get("status", {}).get("liveTime", {}).get("short") or m.get("status", {}).get("reason", {}).get("short"),
+                "started": m.get("status", {}).get("started"),
+                "finished": m.get("status", {}).get("finished"),
+            })
 
     return jsonify({"date": date, "total": len(matches), "matches": matches})
 
 
-@app.route("/match/<int:match_id>/stats")
-def match_stats(match_id: int):
+@app.route("/match/<match_id>/details")
+def match_details(match_id: str):
+    """
+    Detalle completo del partido: stats, lineups, H2H, eventos.
+    GET /match/12345678/details
+    """
     auth_error = check_api_key()
     if auth_error:
         return auth_error
 
-    data, error = sofascore_get(f"/event/{match_id}/statistics")
+    data, error = fotmob_get("/matchDetails", params={"matchId": match_id})
     if error:
         return jsonify({"error": error}), 502
 
+    general = data.get("general", {})
+    content = data.get("content", {})
+    header = data.get("header", {})
+
+    # Stats del partido
+    stats_raw = content.get("stats", {}).get("Periods", {}).get("All", {}).get("stats", [])
+    stats = {}
+    for group in stats_raw:
+        for item in group.get("stats", []):
+            key = item.get("key", item.get("title", "")).lower().replace(" ", "_")
+            stats[key] = {
+                "name": item.get("title"),
+                "home": item.get("stats", [None, None])[0],
+                "away": item.get("stats", [None, None])[1],
+            }
+
+    # Lineups
+    lineup_raw = content.get("lineup", {})
+    def parse_lineup(team_key):
+        team = lineup_raw.get(team_key, {})
+        players = []
+        for p in team.get("players", []):
+            for player in (p if isinstance(p, list) else [p]):
+                players.append({
+                    "name": player.get("name", {}).get("fullName") or player.get("name", {}).get("lastName"),
+                    "position": player.get("position"),
+                    "jersey": player.get("shirt"),
+                    "substitute": player.get("isSub", False),
+                    "rating": player.get("rating", {}).get("num") if player.get("rating") else None,
+                })
+        return {"formation": team.get("lineup"), "players": players}
+
+    # H2H
+    h2h_raw = content.get("h2h", {})
+    h2h_matches = []
+    for m in h2h_raw.get("matches", []):
+        h2h_matches.append({
+            "match_id": m.get("id"),
+            "date": m.get("date"),
+            "home_team": m.get("home", {}).get("name"),
+            "away_team": m.get("away", {}).get("name"),
+            "score": m.get("status", {}).get("scoreStr"),
+        })
+
+    # Eventos (goles, tarjetas)
+    events = []
+    for e in content.get("matchFacts", {}).get("events", {}).get("events", []):
+        events.append({
+            "type": e.get("type"),
+            "minute": e.get("time"),
+            "team": e.get("teamId"),
+            "player": e.get("firstName", "") + " " + e.get("lastName", ""),
+        })
+
+    return jsonify({
+        "match_id": match_id,
+        "tournament": general.get("leagueName"),
+        "home_team": {"id": general.get("homeTeam", {}).get("id"), "name": general.get("homeTeam", {}).get("name")},
+        "away_team": {"id": general.get("awayTeam", {}).get("id"), "name": general.get("awayTeam", {}).get("name")},
+        "score": header.get("status", {}).get("scoreStr"),
+        "status": header.get("status", {}).get("liveTime", {}).get("short"),
+        "stats": stats,
+        "lineups": {
+            "home": parse_lineup("homeTeam"),
+            "away": parse_lineup("awayTeam"),
+        },
+        "h2h": {"total": len(h2h_matches), "matches": h2h_matches},
+        "events": events,
+    })
+
+
+@app.route("/match/<match_id>/stats")
+def match_stats(match_id: str):
+    auth_error = check_api_key()
+    if auth_error:
+        return auth_error
+
+    data, error = fotmob_get("/matchDetails", params={"matchId": match_id})
+    if error:
+        return jsonify({"error": error}), 502
+
+    periods = data.get("content", {}).get("stats", {}).get("Periods", {})
     result = {"match_id": match_id, "periods": {}}
 
-    for period_block in data.get("statistics", []):
-        period = period_block.get("period", "ALL")
+    for period_name, period_data in periods.items():
         period_stats = {}
-        for group in period_block.get("groups", []):
-            for item in group.get("statisticsItems", []):
-                key = item.get("key") or item.get("name", "").lower().replace(" ", "_")
+        for group in period_data.get("stats", []):
+            for item in group.get("stats", []):
+                key = item.get("key", item.get("title", "")).lower().replace(" ", "_")
+                vals = item.get("stats", [None, None])
                 period_stats[key] = {
-                    "name": item.get("name"),
-                    "home": item.get("home"),
-                    "away": item.get("away"),
+                    "name": item.get("title"),
+                    "home": vals[0] if len(vals) > 0 else None,
+                    "away": vals[1] if len(vals) > 1 else None,
                 }
-        result["periods"][period] = period_stats
+        result["periods"][period_name] = period_stats
 
     return jsonify(result)
 
 
-@app.route("/match/<int:match_id>/lineups")
-def match_lineups(match_id: int):
+@app.route("/match/<match_id>/lineups")
+def match_lineups(match_id: str):
     auth_error = check_api_key()
     if auth_error:
         return auth_error
 
-    data, error = sofascore_get(f"/event/{match_id}/lineups")
+    data, error = fotmob_get("/matchDetails", params={"matchId": match_id})
     if error:
         return jsonify({"error": error}), 502
 
-    def parse_lineup(team_data: dict) -> dict:
+    lineup_raw = data.get("content", {}).get("lineup", {})
+
+    def parse_lineup(team_key):
+        team = lineup_raw.get(team_key, {})
         players = []
-        for p in team_data.get("players", []):
-            info = p.get("player", {})
-            players.append({
-                "name": info.get("name"),
-                "position": p.get("position"),
-                "jersey": p.get("jerseyNumber"),
-                "substitute": p.get("substitute", False),
-                "rating": p.get("statistics", {}).get("rating"),
-            })
-        return {"formation": team_data.get("formation"), "players": players}
-
-    return jsonify({
-        "match_id": match_id,
-        "home": parse_lineup(data.get("home", {})),
-        "away": parse_lineup(data.get("away", {})),
-    })
-
-
-@app.route("/match/<int:match_id>/h2h")
-def match_h2h(match_id: int):
-    auth_error = check_api_key()
-    if auth_error:
-        return auth_error
-
-    data, error = sofascore_get(f"/event/{match_id}/h2h/events")
-    if error:
-        return jsonify({"error": error}), 502
-
-    h2h = [format_event(e) for e in data.get("events", [])]
-    return jsonify({"match_id": match_id, "total": len(h2h), "h2h": h2h})
-
-
-@app.route("/team/<int:team_id>/form")
-def team_form(team_id: int):
-    auth_error = check_api_key()
-    if auth_error:
-        return auth_error
-
-    limit = min(int(request.args.get("limit", 5)), 20)
-    data, error = sofascore_get(f"/team/{team_id}/events/last/0")
-    if error:
-        return jsonify({"error": error}), 502
-
-    events = data.get("events", [])[-limit:]
-    form = [format_event(e, team_id) for e in events]
-    results = [m["result"] for m in form if m["result"] != "N/A"]
-
-    return jsonify({
-        "team_id": team_id,
-        "summary": {
-            "W": results.count("W"),
-            "D": results.count("D"),
-            "L": results.count("L"),
-            "string": "".join(results),
-        },
-        "matches": form,
-    })
-
-
-@app.route("/match/<int:match_id>/prematch")
-def match_prematch(match_id: int):
-    auth_error = check_api_key()
-    if auth_error:
-        return auth_error
-
-    form_limit = min(int(request.args.get("form_limit", 5)), 10)
-
-    event_data, error = sofascore_get(f"/event/{match_id}")
-    if error:
-        return jsonify({"error": error}), 502
-
-    event = event_data.get("event", {})
-    home_id = event.get("homeTeam", {}).get("id")
-    away_id = event.get("awayTeam", {}).get("id")
-    home_name = event.get("homeTeam", {}).get("name")
-    away_name = event.get("awayTeam", {}).get("name")
-
-    h2h_data, _ = sofascore_get(f"/event/{match_id}/h2h/events")
-    h2h = [format_event(e) for e in (h2h_data or {}).get("events", [])]
-
-    time.sleep(0.3)
-
-    home_data, _ = sofascore_get(f"/team/{home_id}/events/last/0")
-    home_events = (home_data or {}).get("events", [])[-form_limit:]
-    home_form = [format_event(e, home_id) for e in home_events]
-    home_results = [m["result"] for m in home_form if m["result"] != "N/A"]
-
-    time.sleep(0.3)
-
-    away_data, _ = sofascore_get(f"/team/{away_id}/events/last/0")
-    away_events = (away_data or {}).get("events", [])[-form_limit:]
-    away_form = [format_event(e, away_id) for e in away_events]
-    away_results = [m["result"] for m in away_form if m["result"] != "N/A"]
-
-    return jsonify({
-        "match_id": match_id,
-        "tournament": event.get("tournament", {}).get("name"),
-        "date_ts": event.get("startTimestamp"),
-        "home_team": {"id": home_id, "name": home_name},
-        "away_team": {"id": away_id, "name": away_name},
-        "h2h": {"total": len(h2h), "matches": h2h},
-        "home_form": {
-            "summary": {"W": home_results.count("W"), "D": home_results.count("D"), "L": home_results.count("L"), "string": "".join(home_results)},
-            "matches": home_form,
-        },
-        "away_form": {
-            "summary": {"W": away_results.count("W"), "D": away_results.count("D"), "L": away_results.count("L"), "string": "".join(away_results)},
-            "matches": away_form,
-        },
-    })
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+        for p in team.get("players", []):
+            for player in (p if isinstance(p, list) else [p]):
+                players.append({
+                    "name": player.get("name", {}).get("fullName") or player.get("name", {}).get("lastName"),
+                    "position": player.get("position"),
+                    "jersey": player.get("shirt"),
+                    "substitute": player.get("isSub", False),
+                    "rating": player.get("rating", {}).get("num") if player.get("rating") else None,
