@@ -83,11 +83,6 @@ def health():
 
 @app.route("/matches/date/<date>")
 def matches_by_date(date: str):
-    """
-    Partidos del día. Fecha en formato YYYYMMDD.
-    GET /matches/date/20260727
-    Opcional: ?league=<nombre parcial>
-    """
     auth_error = check_api_key()
     if auth_error:
         return auth_error
@@ -125,10 +120,6 @@ def matches_by_date(date: str):
 
 @app.route("/match/<match_id>/details")
 def match_details(match_id: str):
-    """
-    Detalle completo del partido: stats, lineups, H2H, eventos.
-    GET /match/12345678/details
-    """
     auth_error = check_api_key()
     if auth_error:
         return auth_error
@@ -141,7 +132,6 @@ def match_details(match_id: str):
     content = data.get("content", {})
     header = data.get("header", {})
 
-    # Stats del partido
     stats_raw = content.get("stats", {}).get("Periods", {}).get("All", {}).get("stats", [])
     stats = {}
     for group in stats_raw:
@@ -153,8 +143,8 @@ def match_details(match_id: str):
                 "away": item.get("stats", [None, None])[1],
             }
 
-    # Lineups
     lineup_raw = content.get("lineup", {})
+
     def parse_lineup(team_key):
         team = lineup_raw.get(team_key, {})
         players = []
@@ -169,7 +159,6 @@ def match_details(match_id: str):
                 })
         return {"formation": team.get("lineup"), "players": players}
 
-    # H2H
     h2h_raw = content.get("h2h", {})
     h2h_matches = []
     for m in h2h_raw.get("matches", []):
@@ -181,7 +170,6 @@ def match_details(match_id: str):
             "score": m.get("status", {}).get("scoreStr"),
         })
 
-    # Eventos (goles, tarjetas)
     events = []
     for e in content.get("matchFacts", {}).get("events", {}).get("events", []):
         events.append({
@@ -260,3 +248,107 @@ def match_lineups(match_id: str):
                     "jersey": player.get("shirt"),
                     "substitute": player.get("isSub", False),
                     "rating": player.get("rating", {}).get("num") if player.get("rating") else None,
+                })
+        return {"formation": team.get("lineup"), "players": players}
+
+    return jsonify({
+        "match_id": match_id,
+        "home": parse_lineup("homeTeam"),
+        "away": parse_lineup("awayTeam"),
+    })
+
+
+@app.route("/match/<match_id>/h2h")
+def match_h2h(match_id: str):
+    auth_error = check_api_key()
+    if auth_error:
+        return auth_error
+
+    data, error = fotmob_get("/matchDetails", params={"matchId": match_id})
+    if error:
+        return jsonify({"error": error}), 502
+
+    h2h_raw = data.get("content", {}).get("h2h", {})
+    matches = []
+    for m in h2h_raw.get("matches", []):
+        matches.append({
+            "match_id": m.get("id"),
+            "date": m.get("date"),
+            "home_team": m.get("home", {}).get("name"),
+            "away_team": m.get("away", {}).get("name"),
+            "score": m.get("status", {}).get("scoreStr"),
+        })
+
+    return jsonify({"match_id": match_id, "total": len(matches), "matches": matches})
+
+
+@app.route("/team/<team_id>/info")
+def team_info(team_id: str):
+    auth_error = check_api_key()
+    if auth_error:
+        return auth_error
+
+    data, error = fotmob_get("/teams", params={"id": team_id})
+    if error:
+        return jsonify({"error": error}), 502
+
+    details = data.get("details", {})
+    recent_matches = []
+    for m in data.get("recentResults", {}).get("matches", []):
+        score_str = m.get("status", {}).get("scoreStr", "")
+        is_home = m.get("home", {}).get("id") == int(team_id)
+        recent_matches.append({
+            "match_id": m.get("id"),
+            "date": m.get("status", {}).get("utcTime"),
+            "home_team": m.get("home", {}).get("name"),
+            "away_team": m.get("away", {}).get("name"),
+            "score": score_str,
+            "result": parse_result(score_str, is_home),
+        })
+
+    return jsonify({
+        "team_id": team_id,
+        "name": details.get("name"),
+        "short_name": details.get("shortName"),
+        "country": details.get("country"),
+        "league": details.get("primaryLeague", {}).get("name"),
+        "recent_matches": recent_matches,
+    })
+
+
+@app.route("/league/<league_id>/table")
+def league_table(league_id: str):
+    auth_error = check_api_key()
+    if auth_error:
+        return auth_error
+
+    data, error = fotmob_get("/leagues", params={"id": league_id})
+    if error:
+        return jsonify({"error": error}), 502
+
+    table_raw = data.get("table", [{}])[0].get("data", {}).get("table", {}).get("all", [])
+    table = []
+    for row in table_raw:
+        table.append({
+            "position": row.get("idx"),
+            "team": row.get("name"),
+            "team_id": row.get("id"),
+            "played": row.get("played"),
+            "wins": row.get("wins"),
+            "draws": row.get("draws"),
+            "losses": row.get("losses"),
+            "goals_for": row.get("scoresStr", "0-0").split("-")[0],
+            "goals_against": row.get("scoresStr", "0-0").split("-")[1],
+            "points": row.get("pts"),
+        })
+
+    return jsonify({
+        "league_id": league_id,
+        "name": data.get("details", {}).get("name"),
+        "table": table,
+    })
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
